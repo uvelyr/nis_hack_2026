@@ -11,12 +11,17 @@ import (
 	"strings"
 )
 
-const baseURL = "https://72b0-31-169-21-231.ngrok-free.app/api"
+var baseURL string
 
 var scanner = bufio.NewScanner(os.Stdin)
 var currentUserID uint = 0
 
 func main() {
+	fmt.Print("Enter ip(0 for localhost): ")
+	fmt.Scan(&baseURL)
+	if baseURL == "0" {
+		baseURL = "http://localhost:8080/api"	
+	}
 	fmt.Println("=== Тестовый клиент системы уведомлений ===")
 
 	for {

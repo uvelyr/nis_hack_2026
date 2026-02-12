@@ -230,12 +230,11 @@ func main() {
 		api.POST("/login", login)
 		api.GET("/categories", getCategories)
 		api.POST("/subscribe", subscribe)
-		api.GET("/whatsapp/setup", setupWhatsApp)
 		api.GET("/notifications/:id", getNotifications)
 		api.DELETE("/notifications/:id", deleteNotification)
 		api.POST("/webhook/send", externalWebhook)
 	}
 
-	fmt.Println("🚀 Сервер запущен на http://localhost:8080")
+	fmt.Println("Сервер запущен на http://localhost:8080")
 	r.Run(":8080")
 }
