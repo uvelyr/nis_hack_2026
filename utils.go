@@ -5,61 +5,62 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"os"
+	"strings"
+	"unicode"
+
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/mdp/qrterminal/v3"
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
+// Глобальные переменные
 var db *gorm.DB
 var waClient *whatsmeow.Client
+var jwtKey = []byte("alertmen_secret_key_2026_top_secret")
+
+// --- ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ ---
 
 func initDB() {
-	var err error
-	db, err = gorm.Open(sqlite.Open("alertmen.db"), &gorm.Config{})
-	if err != nil {
-		panic("Ошибка БД: " + err.Error())
-	}
-	db.AutoMigrate(&User{}, &Category{}, &Subscription{}, &Notification{})
+    var err error
+    db, err = gorm.Open(sqlite.Open("alertmen.db"), &gorm.Config{})
+    if err != nil {
+        panic("Ошибка БД: " + err.Error())
+    }
+    // Убираем Category, добавляем Channel и Report
+    db.AutoMigrate(&User{}, &Channel{}, &Subscription{}, &Notification{}, &Report{})
 }
 
 func initWhatsApp() {
-	// 1. Создаем контекст для работы с БД и клиентом
 	ctx := context.Background()
-
-	// 2. Настраиваем логирование (только ошибки, чтобы не спамить в консоль)
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-
-	// 3. Подключаем базу данных сессий WhatsApp. 
-	// Используем WAL и busy_timeout, чтобы избежать блокировок SQLite.
 	dbParams := "file:whatsapp_session.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
+	
 	container, err := sqlstore.New(ctx, "sqlite3", dbParams, dbLog)
 	if err != nil {
 		panic(fmt.Errorf("не удалось инициализировать хранилище WhatsApp: %v", err))
 	}
 
-	// 5. Получаем или создаем устройство в базе
 	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		panic(fmt.Errorf("не удалось получить данные устройства: %v", err))
 	}
 
-	// 6. Инициализируем клиент
 	clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
-
-	// 7. ФИКС СИНХРОНИЗАЦИИ: Отключаем автоматическую подгрузку истории сообщений.
-	// Это экономит трафик и предотвращает массовую запись старых данных в БД.
 	waClient.ManualHistorySyncDownload = true
 
-	// 8. Проверка авторизации и подключение
 	if waClient.Store.ID == nil {
-		// Если сессии нет — запрашиваем QR-код
 		qrChan, _ := waClient.GetQRChannel(ctx)
 		err = waClient.Connect()
 		if err != nil {
@@ -68,51 +69,20 @@ func initWhatsApp() {
 		
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\n====================================")
-				fmt.Println("   ALERTMEN: ПРИВЯЗКА WHATSAPP")
-				fmt.Println("====================================")
+				fmt.Println("\n--- ALERTMEN: SCAN QR CODE ---")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				fmt.Println("Отсканируйте код через WhatsApp -> Связанные устройства")
-			} else {
-				fmt.Println("Статус QR-события:", evt.Event)
 			}
 		}
 	} else {
-		// Если сессия есть — просто подключаемся
 		err = waClient.Connect()
 		if err != nil {
-			panic(fmt.Errorf("ошибка подключения к WhatsApp: %v", err))
+			panic(fmt.Errorf("ошибка подключения: %v", err))
 		}
-		fmt.Println("Alertmen: Сессия WhatsApp успешно восстановлена.")
+		fmt.Println("Alertmen: WhatsApp сессия активна.")
 	}
 }
 
-func seedCategories() {
-	// Список базовых категорий для старта
-	categories := []Category{
-		{Title: "Происшествия", Type: "incident"},
-		{Title: "Погода", Type: "weather"},
-		{Title: "Личные сообщения", Type: "whatsapp"},
-	}
-
-	for _, cat := range categories {
-		var existing Category
-		// Ищем категорию по типу, чтобы не дублировать
-		result := db.Where("type = ?", cat.Type).First(&existing)
-		
-		if result.Error != nil {
-			// Если не нашли (ошибка RecordNotFound), создаем
-			db.Create(&cat)
-			fmt.Printf("Категория [%s] добавлена в базу\n", cat.Title)
-		}
-	}
-}
-
-func generateRandomToken(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
+// --- MIDDLEWARE ---
 
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -126,4 +96,80 @@ func CORSMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+			return
+		}
+
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Format: Bearer {token}"})
+			return
+		}
+
+		token, err := jwt.Parse(parts[1], func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
+			return
+		}
+
+		claims, _ := token.Claims.(jwt.MapClaims)
+		c.Set("userID", uint(claims["user_id"].(float64)))
+		c.Next()
+	}
+}
+
+// --- СЛУЖЕБНЫЕ ФУНКЦИИ ---
+
+func sendWhatsAppMessage(phone, title, content string) {
+	if waClient == nil || !waClient.IsConnected() {
+		return
+	}
+
+	var cleanPhone string
+	for _, r := range phone {
+		if unicode.IsDigit(r) {
+			cleanPhone += string(r)
+		}
+	}
+	if strings.HasPrefix(cleanPhone, "8") && len(cleanPhone) == 11 {
+		cleanPhone = "7" + cleanPhone[1:]
+	}
+
+	targetJID := types.NewJID(cleanPhone, types.DefaultUserServer)
+	formattedText := fmt.Sprintf("*🔔 %s*\n\n%s\n\n_Alertmen Service_", strings.ToUpper(title), content)
+
+	msg := &waProto.Message{Conversation: proto.String(formattedText)}
+	waClient.SendMessage(context.Background(), targetJID, msg)
+}
+
+func generateRandomToken(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func seedChannels() {
+    channels := []Channel{
+        {Title: "Кызылорда: Происшествия", Slug: "kzl_incidents", ModeratorID: 1},
+        {Title: "Кызылорда: Погода", Slug: "kzl_weather", ModeratorID: 1},
+        {Title: "Общий канал", Slug: "global", ModeratorID: 1},
+    }
+
+    for _, ch := range channels {
+        var existing Channel
+        // Ищем по Slug, чтобы не дублировать при каждом запуске
+        if err := db.Where("slug = ?", ch.Slug).First(&existing).Error; err != nil {
+            db.Create(&ch)
+            fmt.Printf("Канал [%s] создан\n", ch.Title)
+        }
+    }
 }

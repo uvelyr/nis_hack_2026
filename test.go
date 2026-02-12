@@ -15,6 +15,8 @@ import (
 var baseURL string
 var scanner = bufio.NewScanner(os.Stdin)
 var currentUserID uint = 0
+var authToken string = "" // Храним JWT здесь
+var userRole string = ""
 
 func main() {
 	fmt.Print("Enter server IP (0 for localhost:8080): ")
@@ -26,22 +28,27 @@ func main() {
 		baseURL = "http://" + inputIP + ":8080/api"
 	}
 
-	fmt.Println("\n--- ALERTMEN TESTER CLIENT ---")
+	fmt.Println("\n--- ALERTMEN JWT TESTER CLIENT ---")
 
 	for {
 		fmt.Println("\n--------------------------------")
-		if currentUserID == 0 {
+		if authToken == "" {
 			fmt.Println("1. Register")
 			fmt.Println("2. Login")
 		} else {
-			fmt.Printf("Logged in as User ID: %d\n", currentUserID)
-			fmt.Println("3. Show Categories")
-			fmt.Println("4. Subscribe to Category")
-			fmt.Println("5. Bind Phone (WhatsApp)")
+			fmt.Printf("Logged in as ID: %d | Role: %s\n", currentUserID, userRole)
+			fmt.Println("3. List Channels")
+			fmt.Println("4. Subscribe to Channel")
+			fmt.Println("5. Update Phone (WhatsApp)")
 			fmt.Println("6. View My Notifications")
+			fmt.Println("7. Create Report (User)")
+			if userRole == "moderator" {
+				fmt.Println("8. [MOD] List Pending Reports")
+				fmt.Println("9. [MOD] Approve Report")
+			}
 			fmt.Println("0. Logout")
 		}
-		fmt.Println("9. Send Webhook Event")
+		fmt.Println("w. Send Debug Webhook")
 		fmt.Println("q. Quit")
 		fmt.Print("\n>> ")
 
@@ -51,27 +58,38 @@ func main() {
 		switch choice {
 		case "1": auth("register")
 		case "2": auth("login")
-		case "3": getCategories()
+		case "3": getRequest("/channels")
 		case "4": subscribe()
 		case "5": setupPhone()
-		case "6": getNotifications()
+		case "6": getRequest("/notifications")
+		case "7": createReport()
+		case "8": getRequest("/moderation/pending")
+		case "9": approveReport()
 		case "0":
+			authToken = ""
 			currentUserID = 0
-			fmt.Println("Session cleared.")
-		case "9": sendWebhook()
-		case "q":
-			return
-		default:
-			fmt.Println("Invalid input.")
+			userRole = ""
+			fmt.Println("Logged out.")
+		case "w": sendWebhook()
+		case "q": return
+		default: fmt.Println("Invalid input.")
 		}
 	}
 }
 
-func postRequest(path string, data interface{}) ([]byte, int) {
+// Универсальный POST запрос с JWT
+func securePost(path string, data interface{}) ([]byte, int) {
 	jsonData, _ := json.Marshal(data)
-	resp, err := http.Post(baseURL+path, "application/json", bytes.NewBuffer(jsonData))
+	req, _ := http.NewRequest("POST", baseURL+path, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Network error: %v\n", err)
+		fmt.Println("Network error:", err)
 		return nil, 500
 	}
 	defer resp.Body.Close()
@@ -79,117 +97,114 @@ func postRequest(path string, data interface{}) ([]byte, int) {
 	return body, resp.StatusCode
 }
 
+// Универсальный GET запрос с JWT
+func getRequest(path string) {
+	req, _ := http.NewRequest("GET", baseURL+path, nil)
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("HTTP Error:", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[%d] Response: %s\n", resp.StatusCode, string(body))
+}
+
 func auth(mode string) {
-    // Force a clear read if there's a leftover newline
-    fmt.Print("Enter Username: ")
-    scanner.Scan() 
-    user := strings.TrimSpace(scanner.Text())
-    
-    fmt.Print("Enter Password: ")
-    scanner.Scan()
-    pass := strings.TrimSpace(scanner.Text())
+	fmt.Print("Username: ")
+	scanner.Scan()
+	user := strings.TrimSpace(scanner.Text())
+	fmt.Print("Password: ")
+	scanner.Scan()
+	pass := strings.TrimSpace(scanner.Text())
 
-    // DEBUG: Add this line to see what the tester is actually sending
-    fmt.Printf("Sending: %s with pass: %s\n", user, pass) 
-
-    if user == "" || pass == "" {
-        fmt.Println("Error: Empty fields not allowed.")
-        return
-    }
-
-	body, code := postRequest("/"+mode, map[string]string{
+	body, code := securePost("/"+mode, map[string]string{
 		"username": user,
 		"password": pass,
 	})
 
-	fmt.Printf("[%d] Server response: %s\n", code, string(body))
-	
+	fmt.Printf("[%d] Server: %s\n", code, string(body))
+
 	if code == 200 || code == 201 {
 		var result map[string]interface{}
-		if err := json.Unmarshal(body, &result); err == nil {
-			if idFloat, ok := result["user_id"].(float64); ok {
-				currentUserID = uint(idFloat)
-				fmt.Printf("Success! ID %d is now active.\n", currentUserID)
-			}
+		json.Unmarshal(body, &result)
+		if token, ok := result["token"].(string); ok {
+			authToken = token
+			currentUserID = uint(result["user_id"].(float64))
+			userRole = result["role"].(string)
+			fmt.Println("JWT Token saved successfully.")
 		}
 	}
 }
 
-func getCategories() {
-	resp, err := http.Get(baseURL + "/categories")
-	if err != nil {
-		fmt.Println("HTTP Error:", err)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println("Available Categories:", string(body))
-}
-
 func subscribe() {
-	if currentUserID == 0 { return }
-	
-	fmt.Print("Category ID: ")
+	fmt.Print("Channel ID: ")
 	scanner.Scan()
-	catID, _ := strconv.Atoi(strings.TrimSpace(scanner.Text()))
-
+	id, _ := strconv.Atoi(scanner.Text())
 	fmt.Print("Enable WhatsApp? (y/n): ")
 	scanner.Scan()
-	sendWA := strings.ToLower(strings.TrimSpace(scanner.Text())) == "y"
+	wa := strings.ToLower(scanner.Text()) == "y"
 
-	body, code := postRequest("/subscribe", map[string]interface{}{
-		"user_id":       currentUserID,
-		"category_id":   uint(catID),
-		"send_whatsapp": sendWA,
+	body, code := securePost("/subscribe", map[string]interface{}{
+		"channel_id":    uint(id),
+		"send_whatsapp": wa,
 	})
-	fmt.Printf("[%d] Subscription result: %s\n", code, string(body))
+	fmt.Printf("[%d] Result: %s\n", code, string(body))
 }
 
 func setupPhone() {
-	if currentUserID == 0 { return }
-
-	fmt.Print("Enter phone number (only digits, e.g. 77071234567): ")
+	fmt.Print("Phone (digits): ")
 	scanner.Scan()
 	phone := strings.TrimSpace(scanner.Text())
-
-	body, code := postRequest("/profile/phone", map[string]interface{}{
-		"user_id": currentUserID,
-		"phone":   phone,
-	})
-	fmt.Printf("[%d] Phone update result: %s\n", code, string(body))
+	body, code := securePost("/profile/phone", map[string]string{"phone": phone})
+	fmt.Printf("[%d] Result: %s\n", code, string(body))
 }
 
-func getNotifications() {
-	if currentUserID == 0 { return }
+func createReport() {
+	fmt.Print("Channel ID: ")
+	scanner.Scan()
+	id, _ := strconv.Atoi(scanner.Text())
+	fmt.Print("Title: ")
+	scanner.Scan()
+	title := scanner.Text()
+	fmt.Print("Content: ")
+	scanner.Scan()
+	content := scanner.Text()
 
-	url := fmt.Sprintf("%s/notifications/%d", baseURL, currentUserID)
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Println("HTTP Error:", err)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println("History:", string(body))
+	body, code := securePost("/reports", map[string]interface{}{
+		"channel_id": uint(id),
+		"title":      title,
+		"content":    content,
+	})
+	fmt.Printf("[%d] Result: %s\n", code, string(body))
+}
+
+func approveReport() {
+	fmt.Print("Report ID to approve: ")
+	scanner.Scan()
+	id := strings.TrimSpace(scanner.Text())
+	body, code := securePost("/moderation/approve/"+id, nil)
+	fmt.Printf("[%d] Result: %s\n", code, string(body))
 }
 
 func sendWebhook() {
-	fmt.Print("Event type (incident/weather/whatsapp): ")
+	fmt.Print("Type (Slug): ")
 	scanner.Scan()
-	t := strings.TrimSpace(scanner.Text())
-	
+	t := scanner.Text()
 	fmt.Print("Title: ")
 	scanner.Scan()
-	title := strings.TrimSpace(scanner.Text())
-	
-	fmt.Print("Message content: ")
+	title := scanner.Text()
+	fmt.Print("Content: ")
 	scanner.Scan()
-	content := strings.TrimSpace(scanner.Text())
+	content := scanner.Text()
 
-	body, code := postRequest("/webhook/send", map[string]string{
-		"type":    t,
-		"title":   title,
-		"content": content,
+	body, code := securePost("/webhook/send", map[string]string{
+		"type": t, "title": title, "content": content,
 	})
-	fmt.Printf("[%d] Webhook result: %s\n", code, string(body))
+	fmt.Printf("[%d] Result: %s\n", code, string(body))
 }
