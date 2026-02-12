@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
+	"strconv"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mdp/qrterminal/v3"
-	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -19,36 +18,38 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"golang.org/x/crypto/bcrypt"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var db *gorm.DB
 var waClient *whatsmeow.Client
-var jwtKey = []byte("alertmen_secret_key_2026_top_secret")
+var jwtKey = []byte("alertmen_secret_key_2026")
 
 func initDB() {
 	var err error
 	db, err = gorm.Open(sqlite.Open("alertmen.db"), &gorm.Config{})
-	if err != nil {
-		panic(err)
-	}
+	if err != nil { panic(err) }
 	db.AutoMigrate(&User{}, &Channel{}, &Subscription{}, &Notification{}, &Report{})
+	os.MkdirAll("./uploads", os.ModePerm)
 }
 
 func initWhatsApp() {
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-	// ИСПРАВЛЕНО: Добавлен context.Background() в начало
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:whatsapp_session.db?_foreign_keys=on", dbLog)
+	
+	// Исправлено: добавлен context.Background() первым аргументом
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to connect to database: %w", err))
 	}
 
-	deviceStore, err := container.GetFirstDevice(context.Background())
+	// Исправлено: добавлен context.Background() в вызов устройства
+	device, err := container.GetFirstDevice(context.Background())
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to get device: %w", err))
 	}
 
-	clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
-	waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	clientLog := waLog.Stdout("Client", "ERROR", true)
+	waClient = whatsmeow.NewClient(device, clientLog)
 
 	if waClient.Store.ID == nil {
 		qrChan, _ := waClient.GetQRChannel(context.Background())
@@ -57,54 +58,51 @@ func initWhatsApp() {
 		
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\n--- SCAN QR CODE ---")
+				fmt.Println("\n--- SCAN THIS QR CODE ---")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			}
 		}
 	} else {
-		waClient.Connect()
+		err = waClient.Connect()
+		if err != nil { panic(err) }
 	}
 }
 
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
+		if c.Request.Method == "OPTIONS" { c.AbortWithStatus(204); return }
 		c.Next()
 	}
 }
 
 func register(c *gin.Context) {
-	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := c.ShouldBindJSON(&input); err != nil { return }
-	h, _ := bcrypt.GenerateFromPassword([]byte(input.Password), 10)
-	user := User{Username: input.Username, Password: string(h)}
-	db.Create(&user)
-	c.JSON(201, gin.H{"status": "created"})
+	var i struct{ Username, Password string }
+	c.ShouldBindJSON(&i)
+	h, _ := bcrypt.GenerateFromPassword([]byte(i.Password), 10)
+	db.Create(&User{Username: i.Username, Password: string(h)})
+	c.JSON(201, gin.H{"status": "ok"})
 }
 
 func createReport(c *gin.Context) {
 	uid, _ := c.Get("userID")
-	var r Report
-	if err := c.ShouldBindJSON(&r); err != nil { return }
-	r.SenderID = uid.(uint)
-	r.Status = "pending"
-	db.Create(&r)
+	file, _ := c.FormFile("image")
+	path := ""
+	if file != nil {
+		path = "uploads/" + file.Filename
+		c.SaveUploadedFile(file, path)
+	}
+	chID, _ := strconv.Atoi(c.PostForm("channel_id"))
+	db.Create(&Report{SenderID: uid.(uint), Title: c.PostForm("title"), Content: c.PostForm("content"), ChannelID: uint(chID), ImagePath: path})
 	c.JSON(201, gin.H{"status": "pending"})
 }
 
 func getNotifications(c *gin.Context) {
 	uid, _ := c.Get("userID")
 	var n []Notification
-	db.Where("user_id = ?", uid).Order("created_at desc").Find(&n)
+	db.Where("user_id = ?", uid).Find(&n)
 	c.JSON(200, n)
 }
 
@@ -119,29 +117,33 @@ func subscribe(c *gin.Context) {
 
 func updatePhone(c *gin.Context) {
 	uid, _ := c.Get("userID")
-	var input struct{ Phone string `json:"phone"` }
-	c.ShouldBindJSON(&input)
-	db.Model(&User{}).Where("id = ?", uid).Update("phone", input.Phone)
+	var i struct{ Phone string }
+	c.ShouldBindJSON(&i)
+	db.Model(&User{}).Where("id = ?", uid).Update("phone", i.Phone)
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-func sendWhatsAppMessage(phone, title, content string) {
-	if waClient == nil { return }
+func sendWhatsAppMessage(phone, title, content, imgPath string) {
+	if waClient == nil || phone == "" { return }
 	var clean string
 	for _, r := range phone { if unicode.IsDigit(r) { clean += string(r) } }
-	if strings.HasPrefix(clean, "8") { clean = "7" + clean[1:] }
 	target := types.NewJID(clean, types.DefaultUserServer)
-	
-	msg := &waProto.Message{Conversation: proto.String(fmt.Sprintf("*%s*\n%s", title, content))}
+	caption := fmt.Sprintf("*%s*\n%s", title, content)
+	var msg *waProto.Message
+	if imgPath != "" {
+		data, _ := os.ReadFile(imgPath)
+		upload, _ := waClient.Upload(context.Background(), data, whatsmeow.MediaImage)
+		msg = &waProto.Message{ImageMessage: &waProto.ImageMessage{
+			Caption: &caption, Mimetype: proto.String("image/jpeg"), 
+			URL: &upload.URL, DirectPath: &upload.DirectPath, MediaKey: upload.MediaKey,
+			FileEncSHA256: upload.FileEncSHA256, FileSHA256: upload.FileSHA256, FileLength: &upload.FileLength,
+		}}
+	} else {
+		msg = &waProto.Message{Conversation: &caption}
+	}
 	waClient.SendMessage(context.Background(), target, msg)
 }
 
 func seedChannels() {
-	chs := []Channel{
-		{Title: "Channel 1", Slug: "ch1", ModeratorID: 1},
-		{Title: "Channel 2", Slug: "ch2", ModeratorID: 1},
-	}
-	for _, ch := range chs {
-		db.Where(Channel{Slug: ch.Slug}).FirstOrCreate(&ch)
-	}
+	db.FirstOrCreate(&Channel{Title: "City News", Slug: "city", ModeratorID: 1})
 }
