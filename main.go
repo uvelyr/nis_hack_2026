@@ -9,28 +9,28 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// --- МОДЕЛИ ДАННЫХ ---
+// --- DATA MODELS ---
 
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Username  string    `gorm:"unique;not null" json:"username"`
 	Password  string    `json:"-"`
 	Phone     string    `json:"phone"`
-	Role      string    `json:"role" gorm:"default:user"` // "user" или "moderator"
+	Role      string    `json:"role" gorm:"default:user"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 type Channel struct {
 	ID          uint   `gorm:"primaryKey" json:"id"`
-	Title       string `json:"title"`        
-	Slug        string `json:"slug"`         
-	ModeratorID uint   `json:"moderator_id"` 
+	Title       string `json:"title"`
+	Slug        string `json:"slug"`
+	ModeratorID uint   `json:"moderator_id"`
 }
 
 type Subscription struct {
-    UserID       uint `gorm:"primaryKey;column:user_id" json:"user_id"`
-    ChannelID    uint `gorm:"primaryKey;column:channel_id" json:"channel_id"`
-    SendWhatsApp bool `gorm:"column:send_whatsapp;not null;default:false" json:"send_whatsapp"`
+	UserID       uint `gorm:"primaryKey;column:user_id" json:"user_id"`
+	ChannelID    uint `gorm:"primaryKey;column:channel_id" json:"channel_id"`
+	SendWhatsApp bool `gorm:"column:send_whatsapp;not null;default:false" json:"send_whatsapp"`
 }
 
 type Report struct {
@@ -39,7 +39,7 @@ type Report struct {
 	ChannelID uint      `json:"channel_id"`
 	Title     string    `json:"title"`
 	Content   string    `json:"content"`
-	Status    string    `json:"status" gorm:"default:pending"` // pending, approved, rejected
+	Status    string    `json:"status" gorm:"default:pending"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -52,38 +52,73 @@ type Notification struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// --- ХЕНДЛЕРЫ АУТЕНТИФИКАЦИИ ---
+// --- HANDLERS ---
 
-func debugWebhook(c *gin.Context) {
-    var input struct {
-        Type    string `json:"type" binding:"required"`
-        Title   string `json:"title"`
-        Content string `json:"content"`
-    }
-    if err := c.ShouldBindJSON(&input); err != nil {
-        c.JSON(400, gin.H{"error": "Bad JSON"})
-        return
+func getModeratorInbox(c *gin.Context) {
+	userID, _ := c.Get("userID")
+
+	// 1. Находим все каналы, где текущий юзер — модератор
+	var channels []Channel
+	db.Where("moderator_id = ?", userID).Find(&channels)
+
+	if len(channels) == 0 {
+		c.JSON(200, []Report{}) // У юзера нет прав модератора ни на одном канале
+		return
 	}
 
-    // В новой логике мы ищем канал по Slug (например "kzl_incident")
-    var channel Channel
-    if err := db.Where("slug = ?", input.Type).First(&channel).Error; err != nil {
-        c.JSON(404, gin.H{"error": "Channel not found with slug: " + input.Type})
-        return
-    }
+	// Собираем ID этих каналов в список
+	var channelIDs []uint
+	for _, ch := range channels {
+		channelIDs = append(channelIDs, ch.ID)
+	}
 
-    // Рассылаем всем подписчикам этого канала напрямую (для теста)
-    var subs []Subscription
-    db.Where("channel_id = ? AND send_whatsapp = ?", channel.ID, 1).Find(&subs)
-    
-    for _, sub := range subs {
-        var u User
-        if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
-            go sendWhatsAppMessage(u.Phone, input.Title, input.Content)
-        }
-    }
+	// 2. Находим все отчеты со статусом 'pending' для этих каналов
+	var pendingReports []Report
+	db.Where("channel_id IN ? AND status = ?", channelIDs, "pending").Find(&pendingReports)
 
-    c.JSON(200, gin.H{"status": "Debug broadcast sent", "recipients": len(subs)})
+	c.JSON(200, pendingReports)
+}
+
+func debugWebhook(c *gin.Context) {
+	var input struct {
+		Type    string `json:"type" binding:"required"`
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"error": "Bad JSON"})
+		return
+	}
+
+	var channel Channel
+	if err := db.Where("slug = ?", input.Type).First(&channel).Error; err != nil {
+		c.JSON(404, gin.H{"error": "Channel not found: " + input.Type})
+		return
+	}
+
+	var subs []Subscription
+	// Find ALL subscribers, don't filter by WhatsApp here
+	db.Where("channel_id = ?", channel.ID).Find(&subs)
+
+	for _, sub := range subs {
+		// 1. ALWAYS Save to Database (hits history regardless of WA)
+		db.Create(&Notification{
+			UserID:    sub.UserID,
+			ChannelID: channel.ID,
+			Title:     input.Title,
+			Content:   input.Content,
+		})
+
+		// 2. Only send WhatsApp if the user enabled it
+		if sub.SendWhatsApp {
+			var u User
+			if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
+				go sendWhatsAppMessage(u.Phone, input.Title, input.Content)
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{"status": "Broadcast finished", "recipients": len(subs)})
 }
 
 func register(c *gin.Context) {
@@ -137,8 +172,6 @@ func login(c *gin.Context) {
 	c.JSON(200, gin.H{"token": tokenString, "user_id": user.ID, "role": user.Role})
 }
 
-// --- ХЕНДЛЕРЫ БИЗНЕС-ЛОГИКИ ---
-
 func updatePhone(c *gin.Context) {
 	userID, _ := c.Get("userID")
 	var input struct {
@@ -169,12 +202,11 @@ func createReport(c *gin.Context) {
 	}
 	db.Create(&report)
 
-	// Уведомление модератору канала
 	var channel Channel
 	db.First(&channel, input.ChannelID)
 	var moderator User
 	if err := db.First(&moderator, channel.ModeratorID).Error; err == nil && moderator.Phone != "" {
-		msg := fmt.Sprintf("⚠️ НОВЫЙ ОТЧЕТ в канале %s\nНужен аппрув!", channel.Title)
+		msg := fmt.Sprintf("⚠️ НОВЫЙ ОТЧЕТ в канале %s", channel.Title)
 		go sendWhatsAppMessage(moderator.Phone, "МОДЕРАЦИЯ", msg)
 	}
 
@@ -191,7 +223,6 @@ func approveReport(c *gin.Context) {
 		return
 	}
 
-	// Проверяем, является ли текущий юзер модератором этого канала
 	var channel Channel
 	db.First(&channel, report.ChannelID)
 	if channel.ModeratorID != userID.(uint) {
@@ -202,17 +233,28 @@ func approveReport(c *gin.Context) {
 	report.Status = "approved"
 	db.Save(&report)
 
-	// Рассылка подписчикам канала
 	var subs []Subscription
-	db.Where("channel_id = ? AND send_whatsapp = ?", report.ChannelID, true).Find(&subs)
+	// Find all subscribers
+	db.Where("channel_id = ?", report.ChannelID).Find(&subs)
 	for _, sub := range subs {
-		var u User
-		if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
-			go sendWhatsAppMessage(u.Phone, report.Title, report.Content)
+		// 1. ALWAYS Save to history
+		db.Create(&Notification{
+			UserID:    sub.UserID,
+			ChannelID: report.ChannelID,
+			Title:     report.Title,
+			Content:   report.Content,
+		})
+
+		// 2. Only WhatsApp if enabled
+		if sub.SendWhatsApp {
+			var u User
+			if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
+				go sendWhatsAppMessage(u.Phone, report.Title, report.Content)
+			}
 		}
 	}
 
-	c.JSON(200, gin.H{"status": "Одобрено и разослано"})
+	c.JSON(200, gin.H{"status": "Одобрено и сохранено для всех подписчиков"})
 }
 
 // --- MAIN ---
@@ -227,18 +269,26 @@ func main() {
 
 	api := r.Group("/api")
 	{
-		// Public routes
 		api.POST("/register", register)
 		api.POST("/login", login)
 		api.POST("/webhook/send", debugWebhook)
 
-		// Protected routes
 		auth := api.Group("/")
 		auth.Use(AuthMiddleware())
 		{
 			auth.POST("/profile/phone", updatePhone)
 			auth.POST("/reports", createReport)
 			auth.POST("/moderation/approve/:id", approveReport)
+
+            auth.GET("/moderation/inbox", getModeratorInbox)
+
+			// FIX: Check history route
+			auth.GET("/notifications", func(c *gin.Context) {
+				uid, _ := c.Get("userID")
+				var notes []Notification
+				db.Where("user_id = ?", uid).Order("created_at desc").Find(&notes)
+				c.JSON(200, notes)
+			})
 
 			auth.GET("/channels", func(c *gin.Context) {
 				var chs []Channel
@@ -248,14 +298,12 @@ func main() {
 
 			auth.POST("/subscribe", func(c *gin.Context) {
 				uid, _ := c.Get("userID")
-
 				var input struct {
 					ChannelID    uint `json:"channel_id"`
 					SendWhatsApp bool `json:"send_whatsapp"`
 				}
-
 				if err := c.ShouldBindJSON(&input); err != nil {
-					c.JSON(400, gin.H{"error": "Invalid JSON: " + err.Error()})
+					c.JSON(400, gin.H{"error": "Invalid JSON"})
 					return
 				}
 
@@ -265,17 +313,12 @@ func main() {
 					SendWhatsApp: input.SendWhatsApp,
 				}
 
-				// Теперь логика сохранения находится внутри хендлера
 				if err := db.Save(&sub).Error; err != nil {
-					c.JSON(500, gin.H{"error": "Database error: " + err.Error()})
+					c.JSON(500, gin.H{"error": "Database error"})
 					return
 				}
 
-				c.JSON(200, gin.H{
-					"status":  "ok",
-					"channel": input.ChannelID,
-					"wa":      input.SendWhatsApp,
-				})
+				c.JSON(200, gin.H{"status": "ok", "channel": input.ChannelID, "wa": input.SendWhatsApp})
 			})
 		}
 	}
