@@ -9,202 +9,114 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 )
 
-var baseURL string
-var scanner = bufio.NewScanner(os.Stdin)
-var currentUserID uint = 0
-var authToken string = "" // Храним JWT здесь
-var userRole string = ""
+var (
+	baseURL     = "http://localhost:8080/api"
+	scanner     = bufio.NewScanner(os.Stdin)
+	authToken   string
+	isModerator bool
+)
 
 func main() {
-	fmt.Print("Enter server IP (0 for localhost:8080): ")
-	scanner.Scan()
-	inputIP := strings.TrimSpace(scanner.Text())
-	if inputIP == "0" || inputIP == "" {
-		baseURL = "http://localhost:8080/api"
-	} else {
-		baseURL = "http://" + inputIP + ":8080/api"
-	}
-
-	fmt.Println("\n--- ALERTMEN JWT TESTER CLIENT ---")
-
 	for {
-		fmt.Println("\n--------------------------------")
+		fmt.Println("\n--- ALERTMEN TESTER ---")
 		if authToken == "" {
-			fmt.Println("1. Register")
-			fmt.Println("2. Login")
+			fmt.Println("1. Register | 2. Login | q. Quit")
 		} else {
-			fmt.Printf("Logged in as ID: %d | Role: %s\n", currentUserID, userRole)
-			fmt.Println("3. List Channels")
-			fmt.Println("4. Subscribe to Channel")
-			fmt.Println("5. Update Phone (WhatsApp)")
-			fmt.Println("6. View My Notifications")
-			fmt.Println("7. Create Report (User)")
-			if userRole == "moderator" {
-				fmt.Println("8. [MOD] List Pending Reports")
-				fmt.Println("9. [MOD] Approve Report")
+			fmt.Printf("Logged in (Moderator: %v)\n", isModerator)
+			fmt.Println("3. List Channels | 4. Subscribe | 5. Send Report")
+			fmt.Println("6. Notifications History")
+			if isModerator {
+				fmt.Println("8. [MOD] View Inbox | 9. [MOD] Approve | 10. [MOD] Reject")
 			}
-			fmt.Println("0. Logout")
+			fmt.Println("0. Logout | q. Quit")
 		}
-		fmt.Println("w. Send Debug Webhook")
-		fmt.Println("q. Quit")
-		fmt.Print("\n>> ")
-
+		fmt.Print(">> ")
 		scanner.Scan()
-		choice := strings.TrimSpace(scanner.Text())
+		input := scanner.Text()
 
-		switch choice {
+		switch input {
 		case "1": auth("register")
 		case "2": auth("login")
 		case "3": getRequest("/channels")
 		case "4": subscribe()
-		case "5": setupPhone()
+		case "5": createReport()
 		case "6": getRequest("/notifications")
-		case "7": createReport()
-		case "8": getRequest("/moderation/pending")
-		case "9": approveReport()
-		case "0":
-			authToken = ""
-			currentUserID = 0
-			userRole = ""
-			fmt.Println("Logged out.")
-		case "w": sendWebhook()
+		case "8": if isModerator { viewInbox() }
+		case "9": if isModerator { moderate("approve") }
+		case "10": if isModerator { moderate("reject") }
+		case "0": authToken = ""; isModerator = false
 		case "q": return
-		default: fmt.Println("Invalid input.")
 		}
 	}
 }
 
-// Универсальный POST запрос с JWT
-func securePost(path string, data interface{}) ([]byte, int) {
-	jsonData, _ := json.Marshal(data)
-	req, _ := http.NewRequest("POST", baseURL+path, bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+func auth(mode string) {
+	fmt.Print("Username: "); scanner.Scan(); u := scanner.Text()
+	fmt.Print("Password: "); scanner.Scan(); p := scanner.Text()
+	data, code := postRequest("/"+mode, map[string]string{"username": u, "password": p})
+	fmt.Printf("[%d] Response: %s\n", code, string(data))
+	if code == 200 {
+		var res map[string]interface{}
+		json.Unmarshal(data, &res)
+		authToken = res["token"].(string)
+		isModerator = res["is_moderator"].(bool)
 	}
+}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Network error:", err)
-		return nil, 500
+func viewInbox() {
+	data, _ := getRequestData("/moderation/inbox")
+	var reports []map[string]interface{}
+	json.Unmarshal(data, &reports)
+	fmt.Println("\n--- PENDING REPORTS ---")
+	for _, r := range reports {
+		fmt.Printf("ID: %v | Title: %s | Content: %s\n", r["id"], r["title"], r["content"])
 	}
+}
+
+func moderate(action string) {
+	fmt.Print("Report ID: "); scanner.Scan(); id := scanner.Text()
+	_, code := postRequest("/moderation/"+action+"/"+id, nil)
+	fmt.Printf("Result: %d\n", code)
+}
+
+// --- HELPERS ---
+
+func postRequest(path string, payload interface{}) ([]byte, int) {
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", baseURL+path, bytes.NewBuffer(b))
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" { req.Header.Set("Authorization", "Bearer "+authToken) }
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil { return nil, 500 }
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return body, resp.StatusCode
 }
 
-// Универсальный GET запрос с JWT
-func getRequest(path string) {
+func getRequestData(path string) ([]byte, int) {
 	req, _ := http.NewRequest("GET", baseURL+path, nil)
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("HTTP Error:", err)
-		return
-	}
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	resp, _ := (&http.Client{}).Do(req)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("[%d] Response: %s\n", resp.StatusCode, string(body))
+	return body, resp.StatusCode
 }
 
-func auth(mode string) {
-	fmt.Print("Username: ")
-	scanner.Scan()
-	user := strings.TrimSpace(scanner.Text())
-	fmt.Print("Password: ")
-	scanner.Scan()
-	pass := strings.TrimSpace(scanner.Text())
-
-	body, code := securePost("/"+mode, map[string]string{
-		"username": user,
-		"password": pass,
-	})
-
-	fmt.Printf("[%d] Server: %s\n", code, string(body))
-
-	if code == 200 || code == 201 {
-		var result map[string]interface{}
-		json.Unmarshal(body, &result)
-		if token, ok := result["token"].(string); ok {
-			authToken = token
-			currentUserID = uint(result["user_id"].(float64))
-			userRole = result["role"].(string)
-			fmt.Println("JWT Token saved successfully.")
-		}
-	}
+func getRequest(path string) {
+	d, c := getRequestData(path)
+	fmt.Printf("[%d] %s\n", c, string(d))
 }
 
 func subscribe() {
-	fmt.Print("Channel ID: ")
-	scanner.Scan()
-	id, _ := strconv.Atoi(scanner.Text())
-	fmt.Print("Enable WhatsApp? (y/n): ")
-	scanner.Scan()
-	wa := strings.ToLower(scanner.Text()) == "y"
-
-	body, code := securePost("/subscribe", map[string]interface{}{
-		"channel_id":    uint(id),
-		"send_whatsapp": wa,
-	})
-	fmt.Printf("[%d] Result: %s\n", code, string(body))
-}
-
-func setupPhone() {
-	fmt.Print("Phone (digits): ")
-	scanner.Scan()
-	phone := strings.TrimSpace(scanner.Text())
-	body, code := securePost("/profile/phone", map[string]string{"phone": phone})
-	fmt.Printf("[%d] Result: %s\n", code, string(body))
+	fmt.Print("CH ID: "); scanner.Scan(); id, _ := strconv.Atoi(scanner.Text())
+	postRequest("/subscribe", map[string]interface{}{"channel_id": id, "send_whatsapp": true})
 }
 
 func createReport() {
-	fmt.Print("Channel ID: ")
-	scanner.Scan()
-	id, _ := strconv.Atoi(scanner.Text())
-	fmt.Print("Title: ")
-	scanner.Scan()
-	title := scanner.Text()
-	fmt.Print("Content: ")
-	scanner.Scan()
-	content := scanner.Text()
-
-	body, code := securePost("/reports", map[string]interface{}{
-		"channel_id": uint(id),
-		"title":      title,
-		"content":    content,
-	})
-	fmt.Printf("[%d] Result: %s\n", code, string(body))
-}
-
-func approveReport() {
-	fmt.Print("Report ID to approve: ")
-	scanner.Scan()
-	id := strings.TrimSpace(scanner.Text())
-	body, code := securePost("/moderation/approve/"+id, nil)
-	fmt.Printf("[%d] Result: %s\n", code, string(body))
-}
-
-func sendWebhook() {
-	fmt.Print("Type (Slug): ")
-	scanner.Scan()
-	t := scanner.Text()
-	fmt.Print("Title: ")
-	scanner.Scan()
-	title := scanner.Text()
-	fmt.Print("Content: ")
-	scanner.Scan()
-	content := scanner.Text()
-
-	body, code := securePost("/webhook/send", map[string]string{
-		"type": t, "title": title, "content": content,
-	})
-	fmt.Printf("[%d] Result: %s\n", code, string(body))
+	fmt.Print("CH ID: "); scanner.Scan(); id, _ := strconv.Atoi(scanner.Text())
+	fmt.Print("Title: "); scanner.Scan(); t := scanner.Text()
+	fmt.Print("Content: "); scanner.Scan(); c := scanner.Text()
+	postRequest("/reports", map[string]interface{}{"channel_id": id, "title": t, "content": c})
 }

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -9,14 +9,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// --- DATA MODELS ---
+// --- MODELS ---
 
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Username  string    `gorm:"unique;not null" json:"username"`
 	Password  string    `json:"-"`
 	Phone     string    `json:"phone"`
-	Role      string    `json:"role" gorm:"default:user"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -52,212 +51,126 @@ type Notification struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// --- HANDLERS ---
+// --- MIDDLEWARES ---
 
-func getModeratorInbox(c *gin.Context) {
-	userID, _ := c.Get("userID")
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if tokenString == "" {
+			c.AbortWithStatusJSON(401, gin.H{"error": "No token"})
+			return
+		}
 
-	// 1. Находим все каналы, где текущий юзер — модератор
-	var channels []Channel
-	db.Where("moderator_id = ?", userID).Find(&channels)
-
-	if len(channels) == 0 {
-		c.JSON(200, []Report{}) // У юзера нет прав модератора ни на одном канале
-		return
-	}
-
-	// Собираем ID этих каналов в список
-	var channelIDs []uint
-	for _, ch := range channels {
-		channelIDs = append(channelIDs, ch.ID)
-	}
-
-	// 2. Находим все отчеты со статусом 'pending' для этих каналов
-	var pendingReports []Report
-	db.Where("channel_id IN ? AND status = ?", channelIDs, "pending").Find(&pendingReports)
-
-	c.JSON(200, pendingReports)
-}
-
-func debugWebhook(c *gin.Context) {
-	var input struct {
-		Type    string `json:"type" binding:"required"`
-		Title   string `json:"title"`
-		Content string `json:"content"`
-	}
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(400, gin.H{"error": "Bad JSON"})
-		return
-	}
-
-	var channel Channel
-	if err := db.Where("slug = ?", input.Type).First(&channel).Error; err != nil {
-		c.JSON(404, gin.H{"error": "Channel not found: " + input.Type})
-		return
-	}
-
-	var subs []Subscription
-	// Find ALL subscribers, don't filter by WhatsApp here
-	db.Where("channel_id = ?", channel.ID).Find(&subs)
-
-	for _, sub := range subs {
-		// 1. ALWAYS Save to Database (hits history regardless of WA)
-		db.Create(&Notification{
-			UserID:    sub.UserID,
-			ChannelID: channel.ID,
-			Title:     input.Title,
-			Content:   input.Content,
+		token, _ := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
 		})
 
-		// 2. Only send WhatsApp if the user enabled it
-		if sub.SendWhatsApp {
-			var u User
-			if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
-				go sendWhatsAppMessage(u.Phone, input.Title, input.Content)
-			}
+		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			c.Set("userID", uint(claims["user_id"].(float64)))
+			c.Set("isModerator", claims["is_moderator"].(bool))
+			c.Next()
+		} else {
+			c.AbortWithStatusJSON(401, gin.H{"error": "Invalid token"})
 		}
 	}
-
-	c.JSON(200, gin.H{"status": "Broadcast finished", "recipients": len(subs)})
 }
 
-func register(c *gin.Context) {
-	var input struct {
-		Username string `json:"username" binding:"required"`
-		Password string `json:"password" binding:"required"`
+func ModeratorMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		isMod, _ := c.Get("isModerator")
+		if isMod != true {
+			c.AbortWithStatusJSON(403, gin.H{"error": "Forbidden: Not a moderator"})
+			return
+		}
+		c.Next()
 	}
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(400, gin.H{"error": "Введите логин и пароль"})
-		return
-	}
-
-	hash, _ := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
-	user := User{Username: input.Username, Password: string(hash), Role: "user"}
-
-	if err := db.Create(&user).Error; err != nil {
-		c.JSON(409, gin.H{"error": "Логин уже занят"})
-		return
-	}
-	c.JSON(201, gin.H{"message": "Аккаунт создан"})
 }
+
+// --- HANDLERS ---
 
 func login(c *gin.Context) {
 	var input struct {
-		Username string `json:"username" binding:"required"`
-		Password string `json:"password" binding:"required"`
+		Username string `json:"username"`
+		Password string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(400, gin.H{"error": "Ошибка входа"})
-		return
-	}
+	c.ShouldBindJSON(&input)
 
 	var user User
 	if err := db.Where("username = ?", input.Username).First(&user).Error; err != nil {
-		c.JSON(401, gin.H{"error": "Пользователь не найден"})
+		c.JSON(401, gin.H{"error": "User not found"})
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
-		c.JSON(401, gin.H{"error": "Неверный пароль"})
+		c.JSON(401, gin.H{"error": "Wrong password"})
 		return
 	}
+
+	var count int64
+	db.Model(&Channel{}).Where("moderator_id = ?", user.ID).Count(&count)
+	isMod := count > 0
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": user.ID,
-		"role":    user.Role,
-		"exp":     time.Now().Add(time.Hour * 72).Unix(),
+		"user_id":      user.ID,
+		"is_moderator": isMod,
+		"exp":          time.Now().Add(time.Hour * 72).Unix(),
 	})
-	tokenString, _ := token.SignedString(jwtKey)
+	t, _ := token.SignedString(jwtKey)
 
-	c.JSON(200, gin.H{"token": tokenString, "user_id": user.ID, "role": user.Role})
+	c.JSON(200, gin.H{"token": t, "user_id": user.ID, "is_moderator": isMod})
 }
 
-func updatePhone(c *gin.Context) {
+func getModeratorInbox(c *gin.Context) {
 	userID, _ := c.Get("userID")
-	var input struct {
-		Phone string `json:"phone" binding:"required"`
-	}
-	c.ShouldBindJSON(&input)
-	db.Model(&User{}).Where("id = ?", userID).Update("phone", input.Phone)
-	c.JSON(200, gin.H{"message": "Телефон обновлен"})
+	var channelIDs []uint
+	db.Model(&Channel{}).Where("moderator_id = ?", userID).Pluck("id", &channelIDs)
+
+	var reports []Report
+	db.Where("channel_id IN ? AND status = ?", channelIDs, "pending").Find(&reports)
+	c.JSON(200, reports)
 }
 
-func createReport(c *gin.Context) {
-	userID, _ := c.Get("userID")
-	var input struct {
-		ChannelID uint   `json:"channel_id" binding:"required"`
-		Title     string `json:"title" binding:"required"`
-		Content   string `json:"content" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(400, gin.H{"error": "Заполните все поля"})
-		return
-	}
-
-	report := Report{
-		SenderID:  userID.(uint),
-		ChannelID: input.ChannelID,
-		Title:     input.Title,
-		Content:   input.Content,
-	}
-	db.Create(&report)
-
-	var channel Channel
-	db.First(&channel, input.ChannelID)
-	var moderator User
-	if err := db.First(&moderator, channel.ModeratorID).Error; err == nil && moderator.Phone != "" {
-		msg := fmt.Sprintf("⚠️ НОВЫЙ ОТЧЕТ в канале %s", channel.Title)
-		go sendWhatsAppMessage(moderator.Phone, "МОДЕРАЦИЯ", msg)
-	}
-
-	c.JSON(201, gin.H{"message": "Отчет отправлен на модерацию"})
-}
-
-func approveReport(c *gin.Context) {
+func moderateReport(c *gin.Context) {
 	userID, _ := c.Get("userID")
 	reportID := c.Param("id")
+	action := c.Param("action")
 
 	var report Report
 	if err := db.First(&report, reportID).Error; err != nil {
-		c.JSON(404, gin.H{"error": "Отчет не найден"})
+		c.JSON(404, gin.H{"error": "Report not found"})
 		return
 	}
 
-	var channel Channel
-	db.First(&channel, report.ChannelID)
-	if channel.ModeratorID != userID.(uint) {
-		c.JSON(403, gin.H{"error": "Вы не модератор этого канала"})
+	var ch Channel
+	db.First(&ch, report.ChannelID)
+	if ch.ModeratorID != userID.(uint) {
+		c.JSON(403, gin.H{"error": "Not your channel"})
 		return
 	}
 
-	report.Status = "approved"
-	db.Save(&report)
+	if action == "approve" {
+		report.Status = "approved"
+		db.Save(&report)
 
-	var subs []Subscription
-	// Find all subscribers
-	db.Where("channel_id = ?", report.ChannelID).Find(&subs)
-	for _, sub := range subs {
-		// 1. ALWAYS Save to history
-		db.Create(&Notification{
-			UserID:    sub.UserID,
-			ChannelID: report.ChannelID,
-			Title:     report.Title,
-			Content:   report.Content,
-		})
-
-		// 2. Only WhatsApp if enabled
-		if sub.SendWhatsApp {
-			var u User
-			if err := db.First(&u, sub.UserID).Error; err == nil && u.Phone != "" {
+		var subs []Subscription
+		db.Where("channel_id = ?", report.ChannelID).Find(&subs)
+		for _, s := range subs {
+			db.Create(&Notification{UserID: s.UserID, ChannelID: report.ChannelID, Title: report.Title, Content: report.Content})
+			if s.SendWhatsApp {
+				var u User
+				db.First(&u, s.UserID)
 				go sendWhatsAppMessage(u.Phone, report.Title, report.Content)
 			}
 		}
+		c.JSON(200, gin.H{"message": "Approved"})
+	} else {
+		report.Status = "rejected"
+		db.Save(&report)
+		c.JSON(200, gin.H{"message": "Rejected"})
 	}
-
-	c.JSON(200, gin.H{"status": "Одобрено и сохранено для всех подписчиков"})
 }
 
-// --- MAIN ---
+// --- MAIN ROUTING ---
 
 func main() {
 	initDB()
@@ -271,57 +184,22 @@ func main() {
 	{
 		api.POST("/register", register)
 		api.POST("/login", login)
-		api.POST("/webhook/send", debugWebhook)
 
 		auth := api.Group("/")
 		auth.Use(AuthMiddleware())
 		{
-			auth.POST("/profile/phone", updatePhone)
 			auth.POST("/reports", createReport)
-			auth.POST("/moderation/approve/:id", approveReport)
+			auth.GET("/notifications", getNotifications)
+			auth.POST("/subscribe", subscribe)
+			auth.POST("/profile/phone", updatePhone)
 
-            auth.GET("/moderation/inbox", getModeratorInbox)
-
-			// FIX: Check history route
-			auth.GET("/notifications", func(c *gin.Context) {
-				uid, _ := c.Get("userID")
-				var notes []Notification
-				db.Where("user_id = ?", uid).Order("created_at desc").Find(&notes)
-				c.JSON(200, notes)
-			})
-
-			auth.GET("/channels", func(c *gin.Context) {
-				var chs []Channel
-				db.Find(&chs)
-				c.JSON(200, chs)
-			})
-
-			auth.POST("/subscribe", func(c *gin.Context) {
-				uid, _ := c.Get("userID")
-				var input struct {
-					ChannelID    uint `json:"channel_id"`
-					SendWhatsApp bool `json:"send_whatsapp"`
-				}
-				if err := c.ShouldBindJSON(&input); err != nil {
-					c.JSON(400, gin.H{"error": "Invalid JSON"})
-					return
-				}
-
-				sub := Subscription{
-					UserID:       uid.(uint),
-					ChannelID:    input.ChannelID,
-					SendWhatsApp: input.SendWhatsApp,
-				}
-
-				if err := db.Save(&sub).Error; err != nil {
-					c.JSON(500, gin.H{"error": "Database error"})
-					return
-				}
-
-				c.JSON(200, gin.H{"status": "ok", "channel": input.ChannelID, "wa": input.SendWhatsApp})
-			})
+			mod := auth.Group("/moderation")
+			mod.Use(ModeratorMiddleware())
+			{
+				mod.GET("/inbox", getModeratorInbox)
+				mod.POST("/:action/:id", moderateReport)
+			}
 		}
 	}
-
 	r.Run(":8080")
 }
