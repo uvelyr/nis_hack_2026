@@ -115,6 +115,24 @@ func login(c *gin.Context) {
 	c.JSON(200, gin.H{"token": t, "user_id": user.ID, "is_moderator": isMod})
 }
 
+func getMySubscriptions(c *gin.Context) {
+    userID, _ := c.Get("userID")
+    
+    var channels []Channel
+    // We join the channels table with subscriptions to find matches for this user
+    err := db.Table("channels").
+        Joins("JOIN subscriptions ON subscriptions.channel_id = channels.id").
+        Where("subscriptions.user_id = ?", userID).
+        Find(&channels).Error
+
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Could not fetch subscriptions"})
+        return
+    }
+
+    c.JSON(200, channels)
+}
+
 func getModeratorInbox(c *gin.Context) {
 	userID, _ := c.Get("userID")
 	var channelIDs []uint
@@ -194,6 +212,26 @@ func getChannels(c *gin.Context) {
 	c.JSON(200, channels)
 }
 
+func unsubscribe(c *gin.Context) {
+    userID, _ := c.Get("userID")
+    channelID := c.Param("id")
+
+    // Delete the subscription record where both user_id and channel_id match
+    result := db.Where("user_id = ? AND channel_id = ?", userID, channelID).Delete(&Subscription{})
+
+    if result.Error != nil {
+        c.JSON(500, gin.H{"error": "Failed to unsubscribe"})
+        return
+    }
+
+    if result.RowsAffected == 0 {
+        c.JSON(404, gin.H{"error": "Subscription not found"})
+        return
+    }
+
+    c.JSON(200, gin.H{"message": "Unsubscribed successfully"})
+}
+
 func main() {
 	initDB()
 	initWhatsApp()
@@ -209,9 +247,11 @@ func main() {
 		auth.Use(AuthMiddleware())
 		{
 			auth.GET("/channels", getChannels)
+            auth.GET("/subscriptions", getMySubscriptions)
 			auth.POST("/reports", createReport)
 			auth.GET("/notifications", getNotifications)
 			auth.POST("/subscribe", subscribe)
+            auth.DELETE("/unsubscribe/:id", unsubscribe)
 			auth.POST("/profile/phone", updatePhone)
 			mod := auth.Group("/moderation")
 			mod.Use(ModeratorMiddleware())
