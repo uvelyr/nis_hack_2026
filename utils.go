@@ -145,5 +145,25 @@ func sendWhatsAppMessage(phone, title, content, imgPath string) {
 }
 
 func seedChannels() {
-	db.FirstOrCreate(&Channel{Title: "City News", Slug: "city", ModeratorID: 1})
+    channels := []Channel{
+        {Title: "Кызылорда: Происшествия", Slug: "kzl_incidents", ModeratorID: 1},
+        {Title: "Кызылорда: Погода", Slug: "kzl_weather", ModeratorID: 1},
+        {Title: "Общий канал", Slug: "global", ModeratorID: 1},
+    }
+    for _, ch := range channels {
+        var existing Channel
+        // Ищем по Slug, чтобы не дублировать при каждом запуске
+        if err := db.Where("slug = ?", ch.Slug).First(&existing).Error; err != nil {
+            db.Create(&ch)
+            fmt.Printf("Канал [%s] создан\n", ch.Title)
+        }
+    }
+	chs := []Channel{
+		{Title: "Channel 1", Slug: "ch1", ModeratorID: 1},
+		{Title: "Channel 2", Slug: "ch2", ModeratorID: 1},
+	}
+	for _, ch := range chs {
+		db.Where(Channel{Slug: ch.Slug}).FirstOrCreate(&ch)
+
+	}
 }
